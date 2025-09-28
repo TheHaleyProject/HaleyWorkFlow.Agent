@@ -1,72 +1,134 @@
 ﻿using Haley.Enums;
 using Haley.Models;
+using Haley.Abstractions;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
-using Haley.Abstractions;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Haley.Utils {
     public class WorkflowEngine : IWorkflowEngine {
-        readonly string Id = Guid.NewGuid().ToString(); //This is my engine Id.
-        private readonly IWorkflowRepository _repository;
+        private readonly string _engineId = Guid.NewGuid().ToString();
+        private readonly IClient _client;
         private readonly ILogger<WorkflowEngine> _logger;
-        private readonly Dictionary<Guid, WorkflowInstance> _activeInstances = new();
-        private readonly Dictionary<Guid, WorkflowDefinition> _definitionCache = new(); //Get the definition only based on the GUID.
+        private readonly Dictionary<Guid, WorkflowDefinition> _definitionCache = new();
 
-        public WorkflowEngine(IWorkflowRepository repository, ILogger<WorkflowEngine> logger) {
-            _repository = repository;
+        public WorkflowEngine(IClient client, ILogger<WorkflowEngine> logger) {
+            _client = client;
             _logger = logger;
         }
 
-        public async Task<IFeedback<Guid>> StartWorkflow(int code, int source, WorkflowPayload? payload) {
-            var definition = await LoadDefinitionAsync(code,source);
-            if (payload == null) payload = new WorkflowPayload();
-            payload.Definition = definition;
-            return await StartWorkFlowInternal(payload);
+        // --- Engine lifecycle ---
+        public async Task RegisterAsync(string environment) {
+            var payload = new { engineId = _engineId, environment };
+            var response = await (await _client
+                .WithEndPoint(ENDPOINTS.ENGINE_REGISTER)
+                .WithBody(new RawBodyRequestContent(payload.ToJson(), true, BodyContentType.StringContent) {
+                    OverrideMIMETypeAutomatically = false
+                })
+                .PostAsync())?.AsStringResponseAsync();
+
+            if (response == null || !response.IsSuccessStatusCode) {
+                _logger.LogError("Engine registration failed for env={env}.", environment);
+                throw new Exception("Engine registration failed.");
+            }
+
+            _logger.LogInformation("Engine {engineId} registered for environment {env}.", _engineId, environment);
         }
 
-        public async Task<IFeedback<Guid>> StartWorkflow(Guid definitionId, WorkflowPayload? payload) {
-            var definition = await LoadDefinitionAsync(definitionId);
-            if (payload == null) payload = new WorkflowPayload();
-            payload.Definition = definition;
-            return await StartWorkFlowInternal(payload);
-        }
-
-        async Task<IFeedback<Guid>> StartWorkFlowInternal(WorkflowPayload payload) {
-            if (payload.Definition == null) throw new ArgumentNullException($@"{nameof(WorkflowPayload)} doesn't contain a valid {nameof(WorkflowDefinition)}");
-
-            var instance = new WorkflowInstance {
-                InstanceId = Guid.NewGuid(), //Are we sure that we are creating this instance here & just synchronizing in the database?
-                DefinitionId = payload.Definition.Guid,
-                Parameters = payload.Parameters,
-                Urls = payload.Urls,
-                State = WorkflowStatus.Pending,
-                CreatedAt = DateTime.UtcNow,
-                LastUpdated = DateTime.UtcNow,
-                Environment = payload.Environment,
-                Name = payload.Definition.Name,
-                Owner = payload.Owner,
-                Reference = payload.Reference
+        public async Task HeartbeatAsync() {
+            var payload = new JsonObject {
+                ["engineId"] = _engineId,
+                ["timestamp"] = DateTime.UtcNow
             };
 
-            _activeInstances[instance.InstanceId] = instance;
-            await _repository.SaveInstanceAsync(instance);
-            _logger.LogInformation($"Workflow {instance.InstanceId} started.");
+            var _ = await (await _client
+                .WithEndPoint(ENDPOINTS.ENGINE_HEARTBEAT)
+                .WithBody(new RawBodyRequestContent(payload.ToJsonString(), true, BodyContentType.StringContent) {
+                    OverrideMIMETypeAutomatically = false
+                })
+                .PostAsync())?.AsStringResponseAsync();
+        }
 
-            return new Feedback<Guid>(true) { Result = instance.InstanceId };
+        // --- Polling & execution ---
+        public async Task PollAndExecuteAsync(string environment) {
+            var response = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE_PENDING)
+                .WithQuery(new QueryParam("env", environment))
+                .GetAsync())?.AsStringResponseAsync();
+
+            if (response == null || !response.IsSuccessStatusCode) {
+                _logger.LogWarning("Polling pending instances failed for env={env}.", environment);
+                return;
+            }
+
+            var instances = response.Content.FromJson<List<WorkflowInstance>>() ?? new List<WorkflowInstance>();
+            foreach (var instance in instances) {
+                if (await ClaimInstanceAsync(instance.InstanceId)) {
+                    _ = ExecuteAsync(instance.InstanceId); // fire-and-forget
+                }
+            }
+        }
+
+        public async Task RecoverOrphanedAsync(string environment) {
+            var response = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE_ORPHANED)
+                .WithQuery(new QueryParam("env", environment))
+                .GetAsync())?.AsStringResponseAsync();
+
+            if (response == null || !response.IsSuccessStatusCode) {
+                _logger.LogWarning("Recover orphaned instances failed for env={env}.", environment);
+                return;
+            }
+
+            var instances = response.Content.FromJson<List<WorkflowInstance>>() ?? new List<WorkflowInstance>();
+            foreach (var instance in instances) {
+                if (await ClaimInstanceAsync(instance.InstanceId)) {
+                    _ = ExecuteAsync(instance.InstanceId);
+                }
+            }
+        }
+
+        private async Task<bool> ClaimInstanceAsync(Guid instanceId) {
+            var payload = new { engineId = _engineId };
+            var response = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE_CLAIM)
+                .WithQuery(new QueryParam("id", instanceId.ToString()))
+                .WithBody(new RawBodyRequestContent(payload.ToJson(), true, BodyContentType.StringContent) {
+                    OverrideMIMETypeAutomatically = false
+                })
+                .PutAsync())?.AsStringResponseAsync();
+
+            var ok = response != null && response.IsSuccessStatusCode;
+            _logger.LogInformation("Claim {instanceId} by {engineId}: {ok}", instanceId, _engineId, ok);
+            return ok;
         }
 
         public async Task ExecuteAsync(Guid instanceId) {
-            if (!_activeInstances.TryGetValue(instanceId, out var instance)) {
-                instance = await _repository.LoadInstanceAsync(instanceId);
-                if (instance == null) throw new InvalidOperationException("Workflow instance not found.");
-                _activeInstances[instanceId] = instance;
+            // Load instance
+            var loadResponse = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE)
+                .WithQuery(new QueryParam("guid", instanceId.ToString()))
+                .GetAsync())?.AsStringResponseAsync();
+
+            if (loadResponse == null || !loadResponse.IsSuccessStatusCode) {
+                _logger.LogError("Instance load failed: {instanceId}", instanceId);
+                throw new Exception($"Instance {instanceId} not found.");
             }
 
+            var instance = loadResponse.Content.FromJson<WorkflowInstance>();
+            if (instance == null) {
+                _logger.LogError("Instance parse failed: {instanceId}", instanceId);
+                throw new Exception("Invalid instance payload.");
+            }
+
+            // Load definition
             var definition = await LoadDefinitionAsync(instance.DefinitionId);
+
+            // Initialize state
             var state = new WorkflowState {
                 Status = WorkflowStatus.Running,
                 StepResults = new Dictionary<int, StepResult>(),
@@ -74,14 +136,17 @@ namespace Haley.Utils {
                 Logs = new List<StepLog>()
             };
 
+            // Execute workflow
             foreach (var phase in definition.Phases) {
                 state.CurrentPhaseCode = phase.Code;
+
                 foreach (var stepCode in phase.Steps) {
                     var step = definition.Steps.First(s => s.Code == stepCode);
                     state.CurrentStepCode = step.Code;
 
                     var result = await ExecuteStepAsync(step, instance.Parameters, instance.Urls);
                     state.StepResults[step.Code] = result;
+
                     state.Logs.Add(new StepLog {
                         StepCode = step.Code,
                         Status = result.Status,
@@ -95,35 +160,57 @@ namespace Haley.Utils {
                     }
                 }
 
-                if (state.Status == WorkflowStatus.Failed)
-                    break;
+                if (state.Status == WorkflowStatus.Failed) break;
             }
 
             instance.State = state.Status;
             instance.LastUpdated = DateTime.UtcNow;
-            //await _repository.UpdateInstanceAsync(instance, state);
-            _logger.LogInformation($"Workflow {instanceId} completed with status {state.Status}.");
+
+            // Push update back to API
+            var updatePayload = new { instance, state };
+            var updateResponse = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE)
+                .WithBody(new RawBodyRequestContent(updatePayload.ToJson(), true, BodyContentType.StringContent) {
+                    OverrideMIMETypeAutomatically = false
+                })
+                .PutAsync())?.AsStringResponseAsync();
+
+            if (updateResponse == null || !updateResponse.IsSuccessStatusCode) {
+                _logger.LogError("Instance update failed: {instanceId}", instanceId);
+                throw new Exception("Failed to update instance.");
+            }
+
+            _logger.LogInformation("Workflow {instanceId} completed with status {status}.", instanceId, state.Status);
         }
 
-        async Task<WorkflowDefinition> LoadDefinitionAsync(int wf_code, int source = 0) {
-            var guidObj = await _repository.GetGuidByWfCode(wf_code,source); //Always fetch the latest item.
-            if (!guidObj.Status) throw new Exception(guidObj.Message);
-            return await LoadDefinitionAsync(guidObj.Result);
-        }
-
-        async Task<WorkflowDefinition> LoadDefinitionAsync(Guid def_guid) {
-            if (_definitionCache.TryGetValue(def_guid, out var cached))
+        // --- Helpers ---
+        private async Task<WorkflowDefinition> LoadDefinitionAsync(Guid defGuid) {
+            if (_definitionCache.TryGetValue(defGuid, out var cached))
                 return cached;
 
-            var defObj = await _repository.LoadWorkflow(def_guid);
-            if (!defObj.Status || defObj.Result == null) throw new Exception(defObj.Message);
-            _definitionCache[def_guid] = defObj.Result;
-            return defObj.Result;
+            var response = await (await _client
+                .WithEndPoint(ENDPOINTS.WORKFLOW)
+                .WithQuery(new QueryParam("guid", defGuid.ToString()))
+                .GetAsync())?.AsStringResponseAsync();
+
+            if (response == null || !response.IsSuccessStatusCode) {
+                _logger.LogError("Definition load failed: {defGuid}", defGuid);
+                throw new Exception("Failed to load workflow definition.");
+            }
+
+            var fb = response.Content.FromJson<Feedback<WorkflowDefinition>>();
+            if (fb == null || !fb.Status || fb.Result == null) {
+                _logger.LogError("Definition feedback invalid: {defGuid}", defGuid);
+                throw new Exception(fb?.Message ?? "Invalid definition response.");
+            }
+
+            _definitionCache[defGuid] = fb.Result;
+            return fb.Result;
         }
 
         private async Task<StepResult> ExecuteStepAsync(WorkflowStep step, Dictionary<string, object> parameters, Dictionary<string, string> urlOverrides) {
-            // Simulate execution logic
-            await Task.Delay(100); // Replace with actual dispatch logic
+            // Placeholder for actual dispatch logic (HTTP call to app, etc.)
+            await Task.Delay(100);
 
             return new StepResult {
                 Status = WorkflowStatus.Completed,
@@ -133,40 +220,50 @@ namespace Haley.Utils {
             };
         }
 
-        private async Task MonitorTimeoutAsync(WorkflowStep step, WorkflowInstance instance, WorkflowState state) {
-            if (TimeSpan.TryParse(step.Timeout, out var timeout)) {
-                var deadline = state.StepResults[step.Code].StartedAt?.Add(timeout);
-                if (deadline.HasValue && DateTime.UtcNow > deadline.Value) {
-                    state.StepResults[step.Code].Status = WorkflowStatus.TimeOut;
-                    state.Logs.Add(new StepLog {
-                        StepCode = step.Code,
-                        Status = WorkflowStatus.TimeOut,
-                        Timestamp = DateTime.UtcNow,
-                        Message = $"Step {step.Code} timed out after {timeout}"
-                    });
-
-                    if (step.OnTimeout?.Steps != null) {
-                        //foreach (var fallbackCode in step.OnTimeout.Steps) {
-                        //    var fallbackStep = instance.Definition.Steps.First(s => s.Code == fallbackCode);
-                        //    await ExecuteStepAsync(fallbackStep, instance.Parameters, instance.UrlOverrides);
-                        //}
-                    }
-                }
-            }
-        }
-
         public async Task HandleWebhookAsync(Guid instanceId, string eventKey, Dictionary<string, object> payload) {
-            //    var instance = await _repository.LoadInstanceAsync(instanceId);
-            //    var state = await _repository.LoadStateAsync(instanceId);
+            var instanceResponse = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE)
+                .WithQuery(new QueryParam("guid", instanceId.ToString()))
+                .GetAsync())?.AsStringResponseAsync();
 
-            //    // Match event to step trigger
-            //    var triggeredStep = instance.Definition.Steps.FirstOrDefault(s => s.Trigger == eventKey);
-            //    if (triggeredStep != null) {
-            //        var result = await ExecuteStepAsync(triggeredStep, payload, instance.UrlOverrides);
-            //        state.StepResults[triggeredStep.Code] = result;
-            //        state.Status = result.Status;
-            //        await _repository.UpdateInstanceAsync(instance, state);
-            //    }
+            if (instanceResponse == null || !instanceResponse.IsSuccessStatusCode) {
+                _logger.LogWarning("Webhook: instance not found {instanceId}", instanceId);
+                return;
+            }
+
+            var instance = instanceResponse.Content.FromJson<WorkflowInstance>();
+            var definition = await LoadDefinitionAsync(instance.DefinitionId);
+
+            var triggeredStep = definition.Steps.FirstOrDefault(s => s.Trigger == eventKey);
+            if (triggeredStep == null) return;
+
+            var result = await ExecuteStepAsync(triggeredStep, payload, instance.Urls);
+
+            var stateResponse = await (await _client
+                .WithEndPoint(ENDPOINTS.STATE)
+                .WithQuery(new QueryParam("guid", instanceId.ToString()))
+                .GetAsync())?.AsStringResponseAsync();
+
+            if (stateResponse == null || !stateResponse.IsSuccessStatusCode) {
+                _logger.LogWarning("Webhook: state load failed {instanceId}", instanceId);
+                return;
+            }
+
+            var state = stateResponse.Content.FromJson<WorkflowState>();
+            state.StepResults[triggeredStep.Code] = result;
+            state.Status = result.Status;
+
+            var updatePayload = new { instance, state };
+            var updateResponse = await (await _client
+                .WithEndPoint(ENDPOINTS.INSTANCE)
+                .WithBody(new RawBodyRequestContent(updatePayload.ToJson(), true, BodyContentType.StringContent) {
+                    OverrideMIMETypeAutomatically = false
+                })
+                .PutAsync())?.AsStringResponseAsync();
+
+            if (updateResponse == null || !updateResponse.IsSuccessStatusCode) {
+                _logger.LogError("Webhook: instance update failed {instanceId}", instanceId);
+            }
         }
     }
 }
