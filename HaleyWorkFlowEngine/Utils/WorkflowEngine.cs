@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Haley.Rest;
 
 namespace Haley.Utils {
     public class WorkflowEngine : IWorkflowEngine {
@@ -16,15 +17,15 @@ namespace Haley.Utils {
         private readonly ILogger<WorkflowEngine> _logger;
         private readonly Dictionary<Guid, WorkflowDefinition> _definitionCache = new();
 
-        public WorkflowEngine(IClient client, ILogger<WorkflowEngine> logger) {
-            _client = client;
+        public WorkflowEngine(ILogger<WorkflowEngine> logger) {
+            //_client = ClientStore.Get("dev");
             _logger = logger;
         }
 
         // --- Engine lifecycle ---
         public async Task RegisterAsync(string environment) {
             var payload = new { engineId = _engineId, environment };
-            var response = await (await _client
+            var response = await (await _client?
                 .WithEndPoint(ENDPOINTS.ENGINE_REGISTER)
                 .WithBody(new RawBodyRequestContent(payload.ToJson(), true, BodyContentType.StringContent) {
                     OverrideMIMETypeAutomatically = false
