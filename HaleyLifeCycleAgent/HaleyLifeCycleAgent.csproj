@@ -20,8 +20,8 @@
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <PackageReleaseNotes>Pilot release</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Engine</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Engine</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Agent</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Agent</RepositoryUrl>
     <OpenApiGenerateDocuments>false</OpenApiGenerateDocuments>
     <Description>Workflow Engine to handle the workflows managed by HaleyWorkflow</Description>
     <RepositoryType>git</RepositoryType>
