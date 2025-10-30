@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <OutputType>Library</OutputType>
     <RootNamespace>Haley</RootNamespace>
-    <AssemblyName>Haley.WorkFlow.Engine</AssemblyName>
+    <AssemblyName>Haley.LifeCycle.Agent</AssemblyName>
     <Authors>TheHaleyProject</Authors>
     <Company>TheHaleyProject</Company>
     <Copyright>Haley 2025</Copyright>
@@ -20,10 +20,10 @@
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <PackageReleaseNotes>Pilot release</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Agent</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/TheHaleyProject/HaleyWorkFlow.Agent</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/TheHaleyProject/HaleyLifeCycle.Agent</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/TheHaleyProject/HaleyLifeCycle.Agent</RepositoryUrl>
     <OpenApiGenerateDocuments>false</OpenApiGenerateDocuments>
-    <Description>Workflow Engine to handle the workflows managed by HaleyWorkflow</Description>
+    <Description>LifeCycle Consumer Agent to handle the workflows managed by HaleyLifeCycle Hub</Description>
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
   <ItemGroup>
